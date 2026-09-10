@@ -1,16 +1,30 @@
-name: IceHost Hourly KeepAlive
+# IceHost 自动续期（综合版）
+# = Mostlai/icehost 原版（已验证可跑） + 状态页自动更新
+#
+# 用法：先 fork https://github.com/Mostlai/icehost
+#   1. 配好 4 个 Secrets（ICEHOST_SERVER_URL / ICEHOST_COOKIES / TG_BOT_TOKEN / TG_CHAT_ID）
+#   2. 用原版 workflow 手动跑一次，确认日志/截图里续期成功
+#   3. 用本文件替换 fork 仓库里的 .github/workflows/renew.yml（文件名随意，保持 .yml）
+#
+# 相比原版的增强：
+#   - 运行结果写入 README 状态页并自动提交（区分：续期成功/未到时间/Cookie失效/异常）
+#   - 记录“上次成功续期”时间，跨运行保留
+#   - README 自动提交顺带解决公开仓库 60 天无提交被禁用定时任务的问题
+#   - 运行记录保留最近 2 条（原版只留 1 条）
+
+name: IceHost Auto Renew
 
 on:
   schedule:
-    - cron: '0 */4 * * *'
+    - cron: '0 */6 * * *' # 每 6 小时（UTC），与面板续期频率限制匹配
   workflow_dispatch:
 
 permissions:
-  contents: read
-  actions: write
+  contents: write # 自动提交 README 需要
+  actions: write # 清理运行记录需要
 
 jobs:
-  check-and-start:
+  renew:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -34,7 +48,9 @@ jobs:
           ICEHOST_COOKIES: ${{ secrets.ICEHOST_COOKIES }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-        run: python icehost_run.py
+        run: |
+          set -o pipefail
+          python icehost_run.py 2>&1 | tee renew_run.log
 
       - name: Upload Debug Screenshot
         if: always()
@@ -44,18 +60,66 @@ jobs:
           path: icehost_debug_screenshot.png
           if-no-files-found: ignore
 
-      - name: 🧹 清理旧的工作流运行记录
+      - name: Update README status page
+        if: always()
+        run: |
+          NOW=$(TZ="Asia/Shanghai" date +"%Y-%m-%d %H:%M:%S")
+          LAST_SUCCESS=$(grep -oP '(?<=上次成功续期\*\*：).*(?= \(北京时间\))' README.md 2>/dev/null || echo "尚无记录")
+
+          if [ ! -f renew_run.log ]; then
+            STATUS="前置步骤失败（依赖安装或 WARP），请查看运行日志 🔴"
+          elif grep -q "服务器已真正成功延长 6 小时有效期" renew_run.log; then
+            STATUS="续期成功，服务器有效期 +6 小时 🟢"
+            LAST_SUCCESS="$NOW"
+          elif grep -q "续期指令已发送" renew_run.log; then
+            STATUS="已点击续期按钮，请结合截图确认结果 🟡"
+          elif grep -q "登录失效" renew_run.log; then
+            STATUS="Cookie 登录失效！请重新抓取并更新 ICEHOST_COOKIES 🔴"
+          elif grep -q "未在页面中找到可用的续期按钮" renew_run.log; then
+            STATUS="未找到续期按钮（页面改版或被 Cloudflare 拦截），请查看截图 🔴"
+          elif grep -q "未到可续期时间" renew_run.log; then
+            STATUS="未到可续期时间，本次静默跳过 ⏳"
+          else
+            STATUS="运行异常，请查看日志与截图 🔴"
+          fi
+
+          cat << EOF > README.md
+          # IceHost 自动续期监控
+
+          基于 [Mostlai/icehost](https://github.com/Mostlai/icehost) 脚本，由 GitHub Actions 每 6 小时自动运行。
+
+          ---
+          - **上次成功续期**：$LAST_SUCCESS (北京时间)
+          - **最近运行时间**：$NOW (北京时间)
+          - **运行状态**：$STATUS
+
+          ## Secrets 说明
+          - \`ICEHOST_SERVER_URL\`：服务器面板页地址
+          - \`ICEHOST_COOKIES\`：面板登录 Cookie（icehostpl_session 的值）
+          - \`TG_BOT_TOKEN\` / \`TG_CHAT_ID\`：Telegram 通知
+          EOF
+
+      - name: Commit and push README
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add README.md
+          git diff --quiet && git diff --staged --quiet || git commit -m "docs: update renewal status [skip ci]"
+          git push origin HEAD:${{ github.ref_name }} || echo "[WARN] README 推送失败，不影响本次续期结果"
+
+      - name: 🧹 清理旧的运行记录（保留最近 2 条）
         if: always()
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           runs=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
-            "https://api.github.com/repos/${{ github.repository }}/actions/runs?per_page=100" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/runs?per_page=10" \
             | jq -r '.workflow_runs[].id')
           count=0
           for run_id in $runs; do
             count=$((count + 1))
-            if [ $count -gt 1 ]; then
+            if [ $count -gt 2 ]; then
               echo "删除运行记录: $run_id"
               curl -s -X DELETE -H "Authorization: Bearer $GH_TOKEN" \
                 "https://api.github.com/repos/${{ github.repository }}/actions/runs/$run_id"
